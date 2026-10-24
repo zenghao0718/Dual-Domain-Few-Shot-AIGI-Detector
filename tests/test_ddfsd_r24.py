@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,25 @@ spec = importlib.util.spec_from_file_location("r24_test_entry", ROOT / "test_ddf
 entry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(entry)
 HAS_NUMPY = importlib.util.find_spec("numpy") is not None
+
+
+SYNTHETIC_BASES = {"acc": [.123456789 + .13 * g for g in range(6)],
+                   "ap": [.234567891 + .09 * g for g in range(6)],
+                   "auc": [.612345678 + .05 * g for g in range(6)]}
+SYNTHETIC_OFFSETS = {"acc": [-.004, -.002, 0, .002, .004],
+                     "ap": [.009, -.006, .003, -.012, .006],
+                     "auc": [-.005, .010, -.015, .020, -.010]}
+
+
+def synthetic_metrics(generator, seed):
+    g, s = logic.GENERATORS.index(generator), logic.SEEDS.index(seed)
+    return {metric: SYNTHETIC_BASES[metric][g] + SYNTHETIC_OFFSETS[metric][s]
+            for metric in ("acc", "ap", "auc")}
+
+
+def synthetic_raw_rows(condition="label_noise_10pct"):
+    return [{"generator": generator, "seed": seed, "condition": condition,
+             **synthetic_metrics(generator, seed)} for generator in logic.GENERATORS for seed in logic.SEEDS]
 
 
 class SelectionTests(unittest.TestCase):
@@ -228,7 +248,7 @@ class SelectionTests(unittest.TestCase):
                         completed[key] = {"generator": generator, "seed": seed, "experiment": experiment, "condition": condition,
                                           "identity": {"SYNTHETIC": True, "checkpoint": {"ckpt_sha256": "SYNTHETIC", "stats_sha256": "SYNTHETIC"},
                                                        "cache_sha256": "SYNTHETIC"}, "selection": selection, "support_manifest": [],
-                                          "metrics": {"acc": .5, "ap": .5, "auc": .5, "alpha_real": .5, "alpha_fake": .5,
+                                          "metrics": {**synthetic_metrics(generator, seed), "alpha_real": .5, "alpha_fake": .5,
                                                       "num_real_support": 10, "num_fake_support": 10, "num_real_query": 11, "num_fake_query": 12}}
             entry.summarize_run(args, jobs, completed, {"reference": "SYNTHETIC_NOT_PROVIDED"})
             root = Path(temp) / "r24"
@@ -242,13 +262,179 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(len(list(csv.DictReader(handle))), 15)
             with open(root / "exclude_ADM/clip_bias/per_seed.csv", newline="") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 5)
+            with open(root / "all_generators_summary.csv", newline="") as handle:
+                values = list(csv.DictReader(handle))
+            macros = [row for row in values if row["scope"] == "MACRO_SIX_GENERATORS"]
+            self.assertEqual({r["condition"] for r in macros}, {"label_noise_10pct", "label_noise_20pct", "label_noise_30pct", "clip_concentrated"})
+            for row in macros:
+                for metric in ("acc", "ap", "auc"):
+                    self.assertAlmostEqual(float(row[metric + "_mean"]), statistics.mean(SYNTHETIC_BASES[metric]) + statistics.mean(SYNTHETIC_OFFSETS[metric]), places=14)
+                    self.assertAlmostEqual(float(row[metric + "_std"]), statistics.pstdev(SYNTHETIC_OFFSETS[metric]), places=14)
+            with open(root / "macro_per_seed.csv", newline="") as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 20)
             del completed[next(iter(completed))]
             entry.summarize_run(args, jobs, completed, {"reference": "SYNTHETIC_NOT_PROVIDED"})
             self.assertEqual(logic.read_json(root / "run_status.json")["status"], "PARTIAL_119_OF_120")
             with open(root / "all_generators_summary.csv", newline="") as handle:
                 values = list(csv.DictReader(handle))
             affected = [r for r in values if r["condition"] == "label_noise_10pct" and r["generator"] == "MACRO"]
-            self.assertEqual(affected[0]["scope"], "PARTIAL_MACRO_AVAILABLE_GENERATORS")
+            self.assertEqual(affected, [])
+            self.assertEqual(len([r for r in values if r["scope"] == "MACRO_SIX_GENERATORS"]), 3)
+
+
+class PaperMacroStatisticsTests(unittest.TestCase):
+    def test_three_metric_macro_stds_are_seed_variation_not_between_generators(self):
+        rows = synthetic_raw_rows()
+        result = logic.paper_macro_by_seed(rows, "label_noise_10pct")
+        self.assertIsNotNone(result)
+        self.assertEqual([r["seed"] for r in result["per_seed"]], list(logic.SEEDS))
+        for metric in ("acc", "ap", "auc"):
+            with self.subTest(metric=metric):
+                actual = result["summary"]
+                expected_std = statistics.pstdev(SYNTHETIC_OFFSETS[metric])
+                old_wrong_std = statistics.pstdev(SYNTHETIC_BASES[metric])
+                self.assertAlmostEqual(actual[metric + "_std"], expected_std, places=14)
+                self.assertGreater(old_wrong_std, 5 * actual[metric + "_std"])
+                for i, row in enumerate(result["per_seed"]):
+                    self.assertAlmostEqual(row[metric], statistics.mean(SYNTHETIC_BASES[metric]) + SYNTHETIC_OFFSETS[metric][i], places=14)
+        self.assertEqual(len({round(result["summary"][m + "_std"], 10) for m in ("acc", "ap", "auc")}), 3)
+
+    def test_opposite_seed_fluctuations_cancel_before_std_not_average_rms_or_flat_std(self):
+        rows = synthetic_raw_rows()
+        for row in rows:
+            g, s = logic.GENERATORS.index(row["generator"]), logic.SEEDS.index(row["seed"])
+            for metric in ("acc", "ap", "auc"):
+                row[metric] = SYNTHETIC_BASES[metric][g] + (-1 if g % 2 else 1) * SYNTHETIC_OFFSETS[metric][s]
+        summary = logic.paper_macro_by_seed(rows, "label_noise_10pct")["summary"]
+        for metric in ("acc", "ap", "auc"):
+            self.assertAlmostEqual(summary[metric + "_std"], 0, places=14)
+            self.assertGreater(statistics.mean(statistics.pstdev(r[metric] for r in rows if r["generator"] == g)
+                                              for g in logic.GENERATORS), 0)
+            self.assertGreater(statistics.pstdev(r[metric] for r in rows), .01)
+
+    def test_input_order_and_query_counts_do_not_change_equal_weight_macro(self):
+        rows = synthetic_raw_rows()
+        expected = logic.paper_macro_by_seed(rows, "label_noise_10pct")
+        for row in rows:
+            row["num_real_query"] = 10 ** logic.GENERATORS.index(row["generator"])
+            row["num_fake_query"] = 7 * row["num_real_query"]
+        self.assertEqual(logic.paper_macro_by_seed(list(reversed(rows)), "label_noise_10pct"), expected)
+
+    def test_missing_generator_seed_duplicate_unknown_ids_and_nonfinite_never_publish_macro(self):
+        rows = synthetic_raw_rows()
+        cases = [[], [r for r in rows if r["generator"] != "ADM"], rows[:-1],
+                 rows + [copy.deepcopy(rows[0])], rows[:-1] + [copy.deepcopy(rows[0])],
+                 [{**r, "generator": "unknown"} if i == 0 else r for i, r in enumerate(rows)],
+                 [{**r, "seed": 105} if i == 0 else r for i, r in enumerate(rows)]]
+        for metric in ("acc", "ap", "auc"):
+            for invalid in (math.nan, math.inf, -math.inf):
+                bad = copy.deepcopy(rows)
+                bad[0][metric] = invalid
+                cases.append(bad)
+        for number, case in enumerate(cases):
+            with self.subTest(case=number):
+                self.assertIsNone(logic.paper_macro_by_seed(case, "label_noise_10pct"))
+
+    def fixture(self, directory):
+        args = types.SimpleNamespace(output_dir=Path(directory), generators=list(logic.GENERATORS), seeds=list(logic.SEEDS),
+                                     experiment="all", noise_rates=list(logic.NOISE_RATES), use_fp16=True)
+        completed = {}
+        for row in synthetic_raw_rows():
+            key = f"{row['generator']}/{row['seed']}/label_noise_10pct"
+            selection = logic.label_noise_selection(21, 22, row["seed"], row["generator"], .1)
+            completed[key] = {"generator": row["generator"], "seed": row["seed"], "experiment": "label_noise",
+                              "condition": row["condition"], "identity": {"SYNTHETIC": True,
+                              "checkpoint": {"ckpt_sha256": "SYNTHETIC", "stats_sha256": "SYNTHETIC"}, "cache_sha256": ""},
+                              "selection": selection, "support_manifest": [],
+                              "metrics": {**{m: row[m] for m in ("acc", "ap", "auc")}, "alpha_real": .5, "alpha_fake": .5,
+                                          "num_real_support": 10, "num_fake_support": 10, "num_real_query": 11, "num_fake_query": 12}}
+        jobs = {"SYNTHETIC_JOB_" + str(i): None for i in range(120)}
+        return args, jobs, completed
+
+    def read_csv(self, path):
+        with open(path, encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def test_one_condition_can_publish_paper_macro_before_120_tasks_and_keep_raw_precision(self):
+        with tempfile.TemporaryDirectory(prefix="r24_SYNTHETIC_macro_") as temp:
+            args, jobs, completed = self.fixture(temp)
+            entry.summarize_run(args, jobs, completed, {"reference": "SYNTHETIC_NOT_PROVIDED"})
+            root = Path(temp) / "r24"
+            self.assertEqual(logic.read_json(root / "run_status.json")["status"], "PARTIAL_30_OF_120")
+            summaries = self.read_csv(root / "all_generators_summary.csv")
+            macros = [r for r in summaries if r["scope"] == "MACRO_SIX_GENERATORS"]
+            self.assertEqual(len(macros), 1)
+            self.assertEqual(macros[0]["std_definition"], "population_std_of_seedwise_six_generator_macros_ddof0")
+            witnesses = self.read_csv(root / "macro_per_seed.csv")
+            self.assertEqual([int(r["seed"]) for r in witnesses], list(logic.SEEDS))
+            for metric in ("acc", "ap", "auc"):
+                self.assertEqual(float(macros[0][metric + "_mean"]), statistics.mean(float(r[metric]) for r in witnesses))
+                self.assertEqual(float(macros[0][metric + "_std"]), statistics.pstdev(float(r[metric]) for r in witnesses))
+                self.assertNotEqual(float(macros[0][metric + "_mean"]), round(float(macros[0][metric + "_mean"]), 4))
+            generator = next(r for r in summaries if r["generator"] == "ADM")
+            raw = self.read_csv(root / "exclude_ADM/label_noise/per_seed.csv")
+            for metric in ("acc", "ap", "auc"):
+                self.assertEqual(float(generator[metric + "_std"]), statistics.pstdev(float(r[metric]) for r in raw))
+            report = (root / "R24_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("先跨六生成器等权平均", report)
+            self.assertIn("五个独立训练 checkpoint", report)
+            for metric in ("acc", "ap", "auc"):
+                self.assertIn(f"{100 * float(macros[0][metric + '_mean']):.2f} ± {100 * float(macros[0][metric + '_std']):.2f}", report)
+
+    def test_adm_only_single_seed_missing_seed_and_duplicate_still_write_progress_without_macros(self):
+        for scope in ("ADM-only", "single-seed", "missing-seed", "duplicate", "unknown-generator"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory(prefix="r24_SYNTHETIC_partial_") as temp:
+                args, jobs, completed = self.fixture(temp)
+                if scope == "ADM-only":
+                    args.generators = ["ADM"]
+                    completed = {k: r for k, r in completed.items() if r["generator"] == "ADM"}
+                elif scope == "single-seed":
+                    args.seeds = [42]
+                    completed = {k: r for k, r in completed.items() if r["seed"] == 42}
+                elif scope == "missing-seed":
+                    completed.pop(next(iter(completed)))
+                elif scope == "duplicate":
+                    completed["SYNTHETIC_DUPLICATE"] = copy.deepcopy(next(iter(completed.values())))
+                else:
+                    extra = copy.deepcopy(next(iter(completed.values())))
+                    extra["generator"] = "unknown"
+                    completed["SYNTHETIC_UNKNOWN_GENERATOR"] = extra
+                entry.summarize_run(args, jobs, completed, {"reference": "SYNTHETIC_NOT_PROVIDED"})
+                root = Path(temp) / "r24"
+                self.assertEqual(logic.read_json(root / "run_status.json")["completed"], len(completed))
+                self.assertEqual(self.read_csv(root / "macro_per_seed.csv"), [])
+                self.assertTrue(all(r["scope"] == "GENERATOR" for r in self.read_csv(root / "all_generators_summary.csv")))
+                self.assertTrue((root / "exclude_ADM/label_noise/per_seed.csv").exists())
+
+    def test_empty_refresh_removes_stale_macro_tables(self):
+        with tempfile.TemporaryDirectory(prefix="r24_SYNTHETIC_empty_") as temp:
+            args, jobs, completed = self.fixture(temp)
+            entry.summarize_run(args, jobs, completed, {})
+            entry.summarize_run(args, jobs, {}, {})
+            root = Path(temp) / "r24"
+            self.assertEqual(self.read_csv(root / "all_generators_summary.csv"), [])
+            self.assertEqual(self.read_csv(root / "macro_per_seed.csv"), [])
+            self.assertEqual(logic.read_json(root / "run_status.json")["status"], "PARTIAL_0_OF_120")
+
+    def test_external_baseline_remains_existing_file_and_generator_mean_delta(self):
+        with tempfile.TemporaryDirectory(prefix="r24_SYNTHETIC_baseline_") as temp:
+            args, jobs, completed = self.fixture(temp)
+            args.baseline_csv = str(Path(temp) / "SYNTHETIC_existing_formal.csv")
+            args.baseline_reference = "SYNTHETIC_EXTERNAL_FILE_NOT_PAPER_DATA"
+            raw = synthetic_raw_rows()
+            for row in raw:
+                for metric in ("acc", "ap", "auc"):
+                    row[metric] += .01
+            logic.write_csv(args.baseline_csv, raw)
+            clean, baseline = entry.existing_baseline(args)
+            self.assertEqual(baseline["status"], "EXTERNAL_EXISTING_FORMAL_CSV_NOT_RERUN")
+            baseline["summary"] = clean
+            entry.summarize_run(args, jobs, completed, baseline)
+            comparisons = self.read_csv(Path(temp) / "r24/baseline_comparison.csv")
+            self.assertEqual(len(comparisons), 6)
+            for row in comparisons:
+                for metric in ("acc", "ap", "auc"):
+                    self.assertAlmostEqual(float(row[metric + "_delta"]), -.01, places=14)
 
 
 def numpy_evaluation_namespace(source):

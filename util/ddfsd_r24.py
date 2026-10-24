@@ -323,3 +323,42 @@ def summarize(rows):
             row[metric + "_std"] = statistics.pstdev(samples)
         result.append(row)
     return result
+
+
+def paper_macro_by_seed(rows, condition):
+    """Aggregate one complete 6-generator x 5-seed raw metric grid.
+
+    Incomplete/invalid grids return None, never a partial paper macro. Input
+    order and query counts do not affect the canonical, equally weighted
+    generator average for each seed. No generator summary/std is consumed.
+    """
+    indexed = {}
+    for row in rows:
+        if row.get("condition") != condition:
+            continue
+        generator, seed = row.get("generator"), row.get("seed")
+        if generator not in GENERATORS or seed not in SEEDS:
+            return None
+        key = (generator, seed)
+        if key in indexed:
+            return None
+        try:
+            metrics = {metric: float(row[metric]) for metric in ("acc", "ap", "auc")}
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if any(not math.isfinite(value) or not 0 <= value <= 1 for value in metrics.values()):
+            return None
+        indexed[key] = metrics
+    if set(indexed) != {(generator, seed) for generator in GENERATORS for seed in SEEDS}:
+        return None
+    per_seed = [{"condition": condition, "seed": seed, "n_generators": len(GENERATORS),
+                 **{metric: statistics.mean(indexed[generator, seed][metric] for generator in GENERATORS)
+                    for metric in ("acc", "ap", "auc")}} for seed in SEEDS]
+    summary = {"scope": "MACRO_SIX_GENERATORS", "generator": "MACRO", "condition": condition,
+               "n_seeds": len(SEEDS), "n_generators": len(GENERATORS), "status": "COMPLETE",
+               "std_definition": "population_std_of_seedwise_six_generator_macros_ddof0"}
+    for metric in ("acc", "ap", "auc"):
+        values = [row[metric] for row in per_seed]
+        summary[metric + "_mean"] = statistics.mean(values)
+        summary[metric + "_std"] = statistics.pstdev(values)
+    return {"summary": summary, "per_seed": per_seed}

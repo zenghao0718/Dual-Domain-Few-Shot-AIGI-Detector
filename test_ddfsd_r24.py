@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import math
 import os
 from pathlib import Path
-import statistics
 import sys
 import traceback
 
@@ -16,7 +15,7 @@ ROOT = Path(__file__).resolve().parent
 from util.ddfsd_r24 import (CLIP_ID, GENERATORS, NOISE_RATES, SEEDS, SHOT, condition_name,
                             clip_selection, digest, file_sha256, label_noise_selection,
                             noise_rates_from_string, outside_repo, read_json, seeds_from_string,
-                            summarize, support_rows, validate_selection, write_csv, write_json)
+                            paper_macro_by_seed, summarize, support_rows, validate_selection, write_csv, write_json)
 
 
 def parse_args(argv=None):
@@ -143,6 +142,10 @@ def read_json_value(value):
 def summarize_run(args, jobs, completed, baseline):
     root = args.output_dir / "r24"
     summaries = []
+    raw_rows = [{"generator": result["generator"], "seed": result["seed"], "condition": result["condition"],
+                 **{metric: result["metrics"][metric] for metric in ("acc", "ap", "auc")}}
+                for result in completed.values()]
+    macro_per_seed = []
     diagnostics_all = []
     for generator in args.generators:
         for experiment in ("label_noise", "clip_bias"):
@@ -182,19 +185,17 @@ def summarize_run(args, jobs, completed, baseline):
                 write_csv(folder / "clip_concentration.csv", concentration)
                 diagnostics_all.extend(concentration)
             summaries.extend({"scope": "GENERATOR", **row, "n_generators": 1} for row in summary)
-    for condition in sorted({row["condition"] for row in summaries}):
-        subset = [row for row in summaries if row["condition"] == condition and row["scope"] == "GENERATOR"]
-        complete = len(subset) == 6 and all(row["n_seeds"] == 5 for row in subset) and args.seeds == list(SEEDS)
-        macro = {"scope": "MACRO_SIX_GENERATORS" if complete else "PARTIAL_MACRO_AVAILABLE_GENERATORS", "generator": "MACRO",
-                 "condition": condition, "n_seeds": min(r["n_seeds"] for r in subset), "n_generators": len(subset),
-                 "std_definition": "population_std_of_generator_seed_means_ddof0", "status": "COMPLETE" if complete else "PARTIAL"}
-        for metric in ("acc", "ap", "auc"):
-            values = [row[metric + "_mean"] for row in subset]
-            macro[metric + "_mean"] = statistics.mean(values)
-            macro[metric + "_std"] = statistics.pstdev(values)
-        summaries.append(macro)
-    if summaries:
-        write_csv(root / "all_generators_summary.csv", summaries)
+    for condition in sorted({row["condition"] for row in raw_rows}):
+        macro = paper_macro_by_seed(raw_rows, condition)
+        if macro is not None and args.generators == list(GENERATORS):
+            summaries.append(macro["summary"])
+            macro_per_seed.extend(macro["per_seed"])
+    # Rewrite even empty tables so partial/empty input cannot leave stale macros.
+    write_csv(root / "all_generators_summary.csv", summaries,
+              ["scope", "generator", "condition", "n_seeds", "std_definition", "acc_mean", "acc_std",
+               "ap_mean", "ap_std", "auc_mean", "auc_std", "status", "n_generators"])
+    write_csv(root / "macro_per_seed.csv", macro_per_seed,
+              ["condition", "seed", "n_generators", "acc", "ap", "auc"])
     comparisons = []
     for row in summaries:
         if row["scope"] != "GENERATOR":
@@ -220,7 +221,10 @@ def summarize_run(args, jobs, completed, baseline):
             "冻结最终双分支 step15000 checkpoint，tau=.2、tau_r=.1、alpha clip=[.25,.75]；RGB/Haar 和频域统计使用原正式代码。",
             "原论文 Clean Baseline 仅引用已有证据，不重新运行；0%（若显式选用）只是一致性检查。",
             "Baseline 来源：" + repr(baseline), "",
-            "汇总先按每生成器 5 seeds 求 mean/pstdev(ddof=0)，再对六个生成器的均值作宏平均；宏 std 是六个生成器均值的 population std，不是 30 次独立 episode 的 std，也不是 seed std。",
+            "每生成器自身的 mean±std 仍在其五个 seeds 上计算，使用 statistics.pstdev(ddof=0)。",
+            "论文口径宏统计：对每个条件、每个 seed 先跨六生成器等权平均，再对五个 seed 宏平均值求 mean±pstdev(ddof=0)，分别得到 mACC、mAP、mAUC。",
+            "宏统计只发布六类×正式五 seeds 的完整唯一有效网格；局部/未完成条件不输出宏行。逐 seed 宏值见 macro_per_seed.csv。",
+            "R2-4 复用每生成器的同一最终 checkpoint，五次波动来自支持集采样 seeds；统计聚合口径对齐论文，不声称使用五个独立训练 checkpoint。",
             "CSV 保留原始浮点精度；下表以百分比显示两位小数。", "", "|scope|generator|condition|n_seeds|ACC mean±std|AP mean±std|AUC mean±std|",
             "|---|---|---|---|---|---|---|"]
     for row in summaries:

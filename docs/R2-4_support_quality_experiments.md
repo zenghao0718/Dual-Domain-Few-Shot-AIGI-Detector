@@ -23,8 +23,9 @@ FP16 默认 true，只在 CUDA autocast 生效；batch 默认128、workers8。�
 CLIP tensor 不送给 DDFSD，DDFSD 仍重新读取原图、使用其自己的正式预处理与两域编码。
 
 默认全部运行：90 个 Label Noise generator-seed-rate 条件 + 30 个 CLIP bias generator-seed 条件，共120次完整 Query 评测。
-这不是几千个独立 episode。每生成器/条件先按5 seeds求 mean±population std（statistics.pstdev，ddof=0），再宏平均六个生成器均值。
-宏 std 明确定义为六个生成器均值的 population std，与生成器内部 seed std 分列。CSV 保存原精度，仅报告显示百分比两位小数。
+这不是几千个独立 episode。每生成器/条件自身的 mean±std 保持在5 seeds上计算（statistics.pstdev，ddof=0）。
+论文口径的 mACC/mAP/mAUC 使用原始逐seed指标：同一seed先对六生成器等权平均，得到五个宏平均值，再对这五个值求 mean±statistics.pstdev（ddof=0）。宏 std 反映五个seed宏平均的波动，不能用六生成器均值的std、各生成器std的平均/RMS或30条原始值的std替代，也不按图像数加权。
+本次R2-4仍复用每生成器的一个正式checkpoint，五次变化来自支持集采样seed；仅统计聚合口径对齐最终论文，不声称使用五个独立训练checkpoint。CSV 保存0–1原始精度，仅报告乘100后显示两位小数。
 
 原论文 Clean Baseline 不重新跑。`--noise-rates 0` 仅用于显式 clean parity 验证，条件名 `clean_parity_only`，不作为新增干净基线证据。
 报告可引用已有正式 per-seed CSV，绝不预填原论文数字或预测本实验表现。
@@ -219,6 +220,7 @@ OUTPUT_DIR/r24/
     config.json
   ...其余五个生成器...
   all_generators_summary.csv
+  macro_per_seed.csv                 # 每个已完整条件5行：同seed六类等权均值
   baseline_reference_summary.csv     # 仅实际提供已有CSV时
   baseline_comparison.csv            # 同上，差值而非预计结果
   R24_REPORT.md                       # 据真实运行结果生成的中文记录
@@ -232,7 +234,10 @@ clip_concentration 比较同seed官方 Random 10+10 的 CLIP内部相似度，�
 任务原子落盘；原命令重启时重新校验身份、SHA、确定性选择、完整Query与指标后复用已完成任务。中断未完成的条件重跑。
 身份包括代码、权重/stats、数据内容清单、缓存、协议、设备环境、精度和batch。改变这些字段，或拉取新commit，须选新输出目录；不绕过身份检查混用旧结果。
 `.r24.lock` 防止并发写；SIGKILL残留时先确认旧进程已结束，再删除对应输出/缓存根目录的锁，重跑原命令。
-范围完整状态为 COMPLETE_REQUESTED_SCOPE，只有默认六类五seeds全部四条件完成才是 COMPLETE_R24_A_B；部分条件仅生成 PARTIAL 范围宏平均，不冒充六类完整宏平均。
+范围完整状态为 COMPLETE_REQUESTED_SCOPE，只有默认六类五seeds全部四条件（120个任务）完成才是 COMPLETE_R24_A_B，任务总数和完成判断不变。
+每个条件独立核验六生成器×正式五seeds的原始指标网格：ID齐全且按GENERATORS/SEEDS固定顺序聚合，每个(generator,seed,condition)唯一，三指标有限且有效，才输出scope=MACRO_SIX_GENERATORS的正式宏行。一个条件完成30个任务即可发布该条件宏统计，不必等待其它90个任务。
+ADM-only、单seed或缺任务时继续保存已有生成器结果及运行状态，省略不完整条件的宏行；不输出临时“mACC±std”或PARTIAL宏行。重复ID/非有限指标不能生成正式宏统计，非法原始指标仍按原有生成器汇总校验失败。
+all_generators_summary.csv中生成器行的std_definition保持seed_population_ddof0；宏行改为population_std_of_seedwise_six_generator_macros_ddof0。macro_per_seed.csv包含condition、seed、n_generators、acc/ap/auc，值为该seed的等权六类宏平均，可直接复算宏均值与std；无完整条件时仅保留表头，避免残留旧宏结果。
 失败记录 FAILED_OR_INTERRUPTED_SEE_LAST_FAILURE；查 traceback，在本机修复并提交后由AutoDL拉新commit、新目录重跑，不现场修改实验逻辑。
 不自动上传数据/缓存/输出，不在 AutoDL commit/push 结果。需要复核时用户自行下载小 CSV、配置、报告；完整索引gzip保留在服务器。
 
@@ -252,8 +257,9 @@ git diff --check
 所有测试路径、向量及临时报告明确 SYNTHETIC，自动清理，不是正式实验结果。原核心 torch 测试在本机缺 torch 时明确 NOT_RUN_ENV_MISSING；安装了原环境时原测试函数照常运行。
 未做：真实 checkpoint/GPU数值parity、真实CLIP加载/提取、全量六类评估、真实集中程度和性能下降；必须由 AutoDL 实际验收，不预判结果支持论文。
 
-本机最终检查：R2-4 专项为20项测试，现成NumPy运行时全部通过；标准Python为15项通过、5项NumPy环境跳过。与既有R2-1一起执行完整 discover 共47项：现成NumPy运行时46项通过、1个原Torch核心模块跳过；标准Python37项通过、10个环境跳过（9项NumPy测试、1个原Torch核心模块）。原核心模块的6个测试函数未执行。
-7个新增/修改Python文件 py_compile 到临时目录通过；两个帮助命令、Bash语法、Shell真实参数传递、git diff --check通过。
-原 test_ddfsd.py、scripts/eval_main.sh、train_ddfsd.py、模型/损失、数据集和正式采样文件 diff为空；仅 util/ddfsd_eval.py 提取私有共享主体，其公开默认行为由不可变原版本合成回归验证。
+本机最终检查：R2-4 专项为28项测试，现成NumPy运行时全部通过；标准Python为23项通过、5项NumPy环境跳过。与既有R2-1一起执行完整 discover 共55项：现成NumPy运行时54项通过、1个原Torch核心模块跳过；标准Python45项通过、10个环境跳过（9项NumPy测试、1个原Torch核心模块）。原核心模块的6个测试函数未执行。
+本次新增8项纯统计回归，覆盖三指标不同波动、反向波动抵消、等权/索引匹配、缺类/缺seed/重复/NaN/Inf、局部进度、单条件先完成、完整120条件、CSV精度及报告格式、旧基线引用不变。未生成真实论文实验数据。
+3个统计修复相关Python文件 py_compile 到临时目录通过；两个帮助命令、Bash语法、Shell真实参数传递、git diff --check通过。
+R2-4 初始实现对 util/ddfsd_eval.py 提取私有共享主体，其公开默认行为由不可变原版本合成回归验证。本次统计修复未再修改评测、选样、模型、缓存或身份逻辑，外部Clean Baseline读取及对应生成器均值差保持不变。AutoDL拉取新commit后须使用新的OUTPUT_DIR，不能强行混用旧commit输出。
 
 API依据：[Transformers CLIP官方文档](https://huggingface.co/docs/transformers/v4.53.3/en/model_doc/clip#transformers.CLIPVisionModelWithProjection)、[Hub预下载/固定revision](https://huggingface.co/docs/huggingface_hub/guides/download)。
