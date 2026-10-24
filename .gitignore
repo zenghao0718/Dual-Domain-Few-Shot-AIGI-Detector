@@ -196,3 +196,16 @@ __pycache__/
 
 # Cursor IDE local config
 .cursor/
+
+# R2-1 diagnostics: generated evidence belongs outside this repository.
+R21_Reliability_Analysis*/
+r21_outputs*/
+per_query/
+per_task/
+*.npz
+*.npy
+*.json.gz
+*.r21.local.json
+.r21.lock
+GenImage/
+DDFSD_pretrained/

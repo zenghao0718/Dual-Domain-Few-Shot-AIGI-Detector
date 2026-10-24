@@ -1,0 +1,3 @@
+# The existing AutoDL environment already supplies requirements.txt.
+# Only the R2-1 plotting addition is needed.
+matplotlib>=3.5
