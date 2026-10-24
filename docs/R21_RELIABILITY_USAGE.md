@@ -68,9 +68,12 @@ export CHECKPOINT_TEMPLATE='exclude_{generator}/ckpt/ddfsd_step[15000].pth'
 Python 等价参数：`--checkpoint-template 'exclude_{generator}/ckpt/ddfsd_step[15000].pth'`。
 另有 `--stats-template` / `STATS_TEMPLATE`，默认 `exclude_{generator}/freq_stats.pt`。
 模板是精确路径，不是 glob；`[15000]` 为字面文件名。二者必须解析到同一 `exclude_<generator>` 任务树，不能跨任务引用或自动寻找相似历史权重。
-程序检查 checkpoint 元数据中的 step=15000、显式 model_mode=dual、exclude_class 与目录一致、配置不冲突、严格 state_dict 加载和有限值；stats mean/std 必须为 [3] 且有限，std 非负。
+程序检查 checkpoint 元数据中的 step=15000、exclude_class 与目录一致、配置不冲突、严格 state_dict 加载和有限值；stats mean/std 必须为 [3] 且有限，std 非负。
+model_mode 兼容正式入口支持的历史双分支权重：分别检查顶层、config 和 args（支持字典或 Namespace），所有显式 model_mode 都必须为 dual；即使顶层为 dual，嵌套单分支声明或 config/args 冲突仍拒绝。显式 None、空串等无效值也拒绝，只有字段缺失才采用历史兼容路径。
+无论是否有模式声明，都实例化 `DDFSDDualDomainNet(pretrained=False, model_mode='dual')`，按该模型的完整 state_dict 核对 RGB/Frequency 的 backbone/projector 四组键，再以 `strict=True` 加载全部参数和 buffer；缺分支、缺个别键、维度不匹配或多余键均拒绝，不凭默认字符串判断架构正确。
+`logs/preflight_validation.json` 与 `run_manifest.json` 的 checkpoints 项记录 `model_mode_confirmation`：有显式声明为 `explicit_dual`，完全缺失声明但结构确认通过为 `legacy_dual_state_dict`；`model_mode_evidence` 保留声明来源、四组完整键数与 strict_load=true。此依据只有全部加载及有限值验证成功后才写为通过。
 先加载 checkpoint，再应用选定 stats，顺序与正式入口相同。历史记录的旧 stats 路径仅保留作审计，不据此加载其它文件。
-无法提供所需元数据的旧 checkpoint 会明确失败，不靠文件名推测其身份。
+历史兼容只允许缺失 model_mode；缺少 step/exclude_class 等原有必要身份或未通过其他检查仍失败，不改写 checkpoint、不靠文件名推测其身份。
 目录配对和 SHA 能防止续跑混用；需要验证文件来源时应使用已知可信 checksum manifest，程序不能仅凭数值证明 stats 的训练来源。
 
 ## 3. 使用原有镜像检查依赖
@@ -156,6 +159,7 @@ python tools/run_r21_reliability.py --validate-only
 任务身份包含 generator、seed、Git commit 与源码 hash、checkpoint/stats SHA、内容哈希数据清单、路径、协议、batch、workers、精度、设备与依赖版本。
 只有身份完全匹配、所有文件 checksum 正确且逐图/Support/指标复算通过才复用；损坏或中断的同身份任务重跑。
 身份不同会停止并保留旧结果，必须选新 OUTPUT_DIR；**拉取修复代码后 commit 改变，也用新目录**。
+如果之前仅在 checkpoint 预检处失败（PARTIAL_0_OF_30），且尚无 `run_manifest.json`，可在拉取修复后沿用原输出目录；已生成 manifest 时仍遵守新目录规则，不手改旧身份文件。
 数据集和权重在一次运行期间应保持只读，不在预检与推理期间替换文件。
 
 写文件采用同目录临时文件+原子替换，任务通过完整语义复算之后才原子写 `per_task/<key>/DONE.json`。
@@ -281,3 +285,12 @@ bash -n scripts/run_r21_reliability.sh
 适配器只验证公式与形状，不是 PyTorch、CUDA 或正式推理验证。测试夹具标记 SYNTHETIC，仅在临时目录生成并清理。
 本机没有的检查标记 NOT_RUN_ENV_MISSING，不为了测试安装 PyTorch/CUDA/timm 或搜索真实数据/权重。
 真实 GPU、原环境兼容性、原正式入口数值 parity、三张真实图表的渲染与论文参考差值，全部需要 AutoDL 实际运行验收。
+
+### 历史 checkpoint 模式兼容修复：本机检查记录
+
+- 标准 Python 3.10、无 numpy/torch：22 项测试通过，4 项 NumPy 合成测试标记 NOT_RUN_ENV_MISSING。
+- 本机已有 NumPy 运行时：26 项测试全部通过，包含新增 8 项 checkpoint 兼容测试以及原有 R2-1 合成复算测试。
+- 新增测试覆盖缺少模式字段的历史双分支、各层显式 dual、显式单分支/无效值、顶层与 config/args 冲突、整支/部分参数缺失、严格加载形状/键错误、无效统计和非有限参数，以及报告确认依据。
+- Python compileall、Bash 语法、Shell 实际参数传递及 git diff --check 均通过。
+- checkpoint 测试使用标准库模型/张量替身，验证完整键集检查、strict=True 调用及 stats 应用顺序；不等同真实 PyTorch 加载。未安装 PyTorch/CUDA，未修改或加载正式 checkpoint，未执行 GPU 实验。
+- 真实模型严格加载与正式实验仍为 GPU_VALIDATION_PENDING_AUTODL；拉取 main 后可在 AutoDL 现有环境运行原入口，无须改 checkpoint 或现场修改逻辑。

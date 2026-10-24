@@ -5,6 +5,7 @@ The --help and --analyze-only paths do not import the deep-learning runtime.
 """
 
 import argparse
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import importlib.metadata
 import json
@@ -81,8 +82,8 @@ def load_runtime():
     global np, torch, DDFSDDualDomainNet, load_ddfsd_class_dataset, make_subset_loader
     global compute_alpha, compute_prototypes, compute_query_logits, compute_support_sigmas
     global binary_metrics, encode_batch, load_frequency_stats, set_seed
-    global audit_image_paths, load_checkpoint, checkpoint_model_mode
-    from test_ddfsd import audit_image_paths, checkpoint_model_mode, load_checkpoint
+    global audit_image_paths, load_checkpoint
+    from test_ddfsd import audit_image_paths, load_checkpoint
     import numpy as np
     import torch
     from datasets.ddfsd_datasets import load_ddfsd_class_dataset, make_subset_loader
@@ -140,30 +141,61 @@ def task_paths(args, generator):
     return paths
 
 
-def checkpoint_config(checkpoint):
-    config = checkpoint.get("config", checkpoint.get("args", {}))
-    return config if isinstance(config, dict) else vars(config)
+def checkpoint_metadata_sources(checkpoint):
+    """Inspect both historical config containers; precedence must not hide conflicts."""
+    sources = {"checkpoint": checkpoint}
+    for name in ("config", "args"):
+        value = checkpoint.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, Mapping):
+            try:
+                value = vars(value)
+            except TypeError as error:
+                raise ValueError(f"Checkpoint {name} must be a mapping or namespace") from error
+        sources[name] = value
+    return sources
 
 
 def checked_model(checkpoint_path, stats_path, generator):
     checkpoint = load_checkpoint(str(checkpoint_path))
-    config = checkpoint_config(checkpoint)
+    sources = checkpoint_metadata_sources(checkpoint)
+    config = sources.get("config", sources.get("args", {}))
     if int(checkpoint.get("step", -1)) != 15000:
         raise ValueError("Checkpoint metadata step must be exactly 15000 (filename is insufficient)")
-    recorded_mode = checkpoint.get("model_mode", config.get("model_mode"))
-    if recorded_mode != "dual" or checkpoint_model_mode(checkpoint) != "dual":
-        raise ValueError("Checkpoint metadata must explicitly declare model_mode=dual")
+    declarations = {name + ".model_mode": source["model_mode"] for name, source in sources.items()
+                    if "model_mode" in source}
+    if any(not isinstance(value, str) or value != "dual" for value in declarations.values()):
+        detail = ", ".join(f"{name}={value!r}" for name, value in declarations.items())
+        raise ValueError("Checkpoint model_mode declarations must agree on dual; "
+                         "explicit non-dual or conflicting metadata: " + detail)
     excluded = checkpoint.get("exclude_class", config.get("exclude_class"))
     if excluded != generator:
         raise ValueError(f"Checkpoint exclude_class={excluded!r}, expected {generator}")
-    for name, expected in (("exclude_class", generator), ("model_mode", "dual")):
-        if name in config and config[name] != expected:
-            raise ValueError(f"Conflicting checkpoint config {name}={config[name]!r}")
+    for name, source in sources.items():
+        if "exclude_class" in source and source["exclude_class"] != generator:
+            raise ValueError(f"Conflicting checkpoint {name}.exclude_class={source['exclude_class']!r}")
     stats = load_frequency_stats(str(stats_path))
     if not all(torch.isfinite(stats[name]).all().item() for name in ("mean", "std")) or (stats["std"] < 0).any().item():
         raise ValueError("Stats must be finite, std nonnegative, shape exactly [3]")
     model = DDFSDDualDomainNet(pretrained=False, model_mode="dual")
-    model.load_state_dict(checkpoint["model"], strict=True)
+    state = checkpoint["model"]
+    if not isinstance(state, Mapping):
+        raise ValueError("Checkpoint model must be a state_dict mapping")
+    expected_keys = set(model.state_dict())
+    branch_counts = {}
+    for prefix in ("rgb_backbone.", "rgb_projector.", "freq_backbone.", "freq_projector."):
+        required = {name for name in expected_keys if name.startswith(prefix)}
+        if not required:
+            raise RuntimeError("Dual model has no expected state_dict keys for " + prefix)
+        missing = sorted(required.difference(state))
+        if missing:
+            raise ValueError(f"Incomplete dual checkpoint branch {prefix}: missing {len(missing)} keys, "
+                             + ", ".join(missing[:8]))
+        branch_counts[prefix] = len(required)
+    # Metadata-free legacy checkpoints must prove the same architecture as an
+    # explicit dual checkpoint: every branch key, shape and buffer must load.
+    model.load_state_dict(state, strict=True)
     # Same order as test_ddfsd.py: checkpoint buffers first, selected stats last.
     model.set_freq_stats(stats["mean"], stats["std"])
     model.eval()
@@ -172,6 +204,10 @@ def checked_model(checkpoint_path, stats_path, generator):
         if tensor.is_floating_point() and not torch.isfinite(tensor).all().item():
             raise ValueError("Non-finite checkpoint tensor: " + name)
     return model, {"step": 15000, "model_mode": "dual", "exclude_class": excluded,
+                   "model_mode_confirmation": "explicit_dual" if declarations else "legacy_dual_state_dict",
+                   "model_mode_evidence": {"declarations": declarations,
+                                           "branch_state_dict_key_counts": branch_counts,
+                                           "strict_load": True},
                    "recorded_freq_stats_path": str(checkpoint.get("freq_stats_path", config.get("freq_stats_path", ""))),
                    "stats_mean": stats["mean"].tolist(), "stats_std": stats["std"].tolist()}
 
@@ -215,7 +251,8 @@ def preflight(args, device):
             model, metadata = checked_model(ckpt_path, stats_path, generator)
             del model
             checkpoints[generator] = {**hashes, "ckpt_path": str(ckpt_path), "stats_path": str(stats_path), **metadata}
-            print(f"  exclude_{generator}: step=15000 dual, strict load PASS", flush=True)
+            print(f"  exclude_{generator}: step=15000 dual, strict load PASS; "
+                  f"mode confirmation={metadata['model_mode_confirmation']}", flush=True)
         except Exception as error:
             errors.append(f"exclude_{generator}: {type(error).__name__}: {error}")
     try:

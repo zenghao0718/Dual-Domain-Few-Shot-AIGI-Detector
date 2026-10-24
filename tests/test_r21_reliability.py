@@ -6,6 +6,7 @@ loss-function adapters and on-disk 30-task fixtures are also exercised.
 
 import ast
 import copy
+from contextlib import ExitStack
 import csv
 import importlib.util
 import math
@@ -149,9 +150,8 @@ class StandardLibraryTests(unittest.TestCase):
                        {"model_mode": None}, {"config": {"model_mode": "freq-only"}}):
             checkpoint = {"model": {}, "step": 15000, "model_mode": "dual", "exclude_class": "ADM", **change}
             with self.subTest(change=change), mock.patch.object(runner, "load_checkpoint", return_value=checkpoint, create=True):
-                with mock.patch.object(runner, "checkpoint_model_mode", return_value="dual", create=True):
-                    with self.assertRaises(ValueError):
-                        runner.checked_model("synthetic.pth", "synthetic.pt", "ADM")
+                with self.assertRaises(ValueError):
+                    runner.checked_model("synthetic.pth", "synthetic.pt", "ADM")
 
     def test_help_needs_no_torch(self):
         for name in ("run_r21_reliability.py", "analyze_r21_reliability.py"):
@@ -220,12 +220,20 @@ class StandardLibraryTests(unittest.TestCase):
             with mock.patch.object(runner, "git_identity", return_value={"git_commit": "synthetic", "source_sha256": "synthetic"}), \
                  mock.patch.object(runner, "load_ddfsd_class_dataset", side_effect=lambda root, name, split, **kw: datasets[name], create=True), \
                  mock.patch.object(runner, "audit_image_paths", return_value=[], create=True), \
-                 mock.patch.object(runner, "checked_model", return_value=(object(), {"step": 15000})) as load, \
+                 mock.patch.object(runner, "checked_model", side_effect=lambda ckpt, stats, generator: (object(), {
+                     "step": 15000,
+                     "model_mode_confirmation": "legacy_dual_state_dict" if generator == "ADM" else "explicit_dual",
+                     "model_mode_evidence": {"strict_load": True}})) as load, \
                  mock.patch.object(runner, "runtime_environment", return_value={"synthetic": True}), \
                  mock.patch.dict(sys.modules, modules):
                 manifest, _ = runner.preflight(args, types.SimpleNamespace(type="cpu"))
                 self.assertEqual(len(manifest["tasks"]), 30)
                 self.assertEqual(load.call_count, 6)
+                validation = common.read_json(args.output_dir / "logs" / "preflight_validation.json")
+                self.assertEqual(validation["checkpoints"]["ADM"]["model_mode_confirmation"], "legacy_dual_state_dict")
+                self.assertEqual(validation["checkpoints"]["BigGAN"]["model_mode_confirmation"], "explicit_dual")
+                self.assertTrue(validation["checkpoints"]["ADM"]["model_mode_evidence"]["strict_load"])
+                self.assertEqual(manifest["checkpoints"], validation["checkpoints"])
                 for generator in common.GENERATORS:
                     runner.task_paths(args, generator)[0].unlink()
                 load.reset_mock()
@@ -234,6 +242,189 @@ class StandardLibraryTests(unittest.TestCase):
                 validation = common.read_json(args.output_dir / "logs" / "preflight_validation.json")
                 self.assertEqual(len(validation["errors"]), 6)
                 self.assertEqual(load.call_count, 0)
+
+
+class CheckpointCompatibilityTests(unittest.TestCase):
+    """Run checked_model end-to-end with standard-library runtime test doubles.
+
+    The model double enforces key/shape checks and records strict=True. This is
+    not a claim that the actual PyTorch model was loaded on the local machine.
+    """
+
+    class Flag:
+        def __init__(self, value):
+            self.value = value
+
+        def all(self):
+            return self
+
+        def any(self):
+            return self
+
+        def item(self):
+            return self.value
+
+    class Tensor:
+        def __init__(self, values=(1.0,), shape=None):
+            self.values = list(values)
+            self.shape = shape or (len(self.values),)
+
+        def tolist(self):
+            return list(self.values)
+
+        def is_floating_point(self):
+            return True
+
+        def __lt__(self, other):
+            return CheckpointCompatibilityTests.Flag(any(value < other for value in self.values))
+
+    def setUp(self):
+        patches = ExitStack()
+        self.addCleanup(patches.close)
+        self.expected = {prefix + name: self.Tensor() for prefix in
+                         ("rgb_backbone.", "rgb_projector.", "freq_backbone.", "freq_projector.")
+                         for name in ("weight", "bias")}
+        self.expected.update(freq_mean=self.Tensor((0, 0, 0)), freq_std=self.Tensor((1, 1, 1)))
+        self.checkpoint = {"step": 15000, "exclude_class": "ADM", "model": copy.deepcopy(self.expected)}
+        self.stats = {"mean": self.Tensor((.1, .2, .3)), "std": self.Tensor((1, 2, 3))}
+        self.loaded = copy.deepcopy(self.expected)
+        self.events = []
+        self.model = mock.Mock()
+        self.model.state_dict.side_effect = lambda: self.loaded
+
+        def strict_load(state, strict):
+            self.events.append("load_state_dict")
+            if strict is not True or set(state) != set(self.expected):
+                raise RuntimeError("SYNTHETIC strict state_dict key mismatch")
+            if any(state[name].shape != expected.shape for name, expected in self.expected.items()):
+                raise RuntimeError("SYNTHETIC strict state_dict shape mismatch")
+            self.loaded = dict(state)
+
+        def set_stats(mean, std):
+            self.events.append("set_freq_stats")
+            self.loaded.update(freq_mean=mean, freq_std=std)
+
+        self.model.load_state_dict.side_effect = strict_load
+        self.model.set_freq_stats.side_effect = set_stats
+        self.load = patches.enter_context(mock.patch.object(runner, "load_checkpoint", return_value=self.checkpoint, create=True))
+        self.load_stats = patches.enter_context(mock.patch.object(runner, "load_frequency_stats", return_value=self.stats, create=True))
+        self.factory = patches.enter_context(mock.patch.object(runner, "DDFSDDualDomainNet", return_value=self.model, create=True))
+        torch = types.SimpleNamespace(isfinite=lambda value: self.Flag(all(math.isfinite(x) for x in value.values)))
+        patches.enter_context(mock.patch.object(runner, "torch", torch, create=True))
+
+    def check(self):
+        return runner.checked_model("SYNTHETIC_checkpoint.pth", "SYNTHETIC_stats.pt", "ADM")
+
+    def test_legacy_dual_without_model_mode_requires_full_branches_and_strict_load(self):
+        self.checkpoint.update(config={"exclude_class": "ADM"}, args=types.SimpleNamespace(exclude_class="ADM"))
+        model, metadata = self.check()
+        self.assertIs(model, self.model)
+        self.assertEqual(metadata["model_mode"], "dual")
+        self.assertEqual(metadata["model_mode_confirmation"], "legacy_dual_state_dict")
+        evidence = metadata["model_mode_evidence"]
+        self.assertEqual(evidence["declarations"], {})
+        self.assertEqual(evidence["branch_state_dict_key_counts"], {prefix: 2 for prefix in
+                         ("rgb_backbone.", "rgb_projector.", "freq_backbone.", "freq_projector.")})
+        self.assertTrue(evidence["strict_load"])
+        self.factory.assert_called_once_with(pretrained=False, model_mode="dual")
+        self.model.load_state_dict.assert_called_once_with(self.checkpoint["model"], strict=True)
+        self.assertEqual(self.events, ["load_state_dict", "set_freq_stats"])
+        self.model.eval.assert_called_once_with()
+        self.model.requires_grad_.assert_called_once_with(False)
+        self.assertEqual(metadata["stats_mean"], [.1, .2, .3])
+
+    def test_explicit_dual_at_each_metadata_source_and_agreeing_sources(self):
+        cases = ({"model_mode": "dual"}, {"config": {"model_mode": "dual"}},
+                 {"args": {"model_mode": "dual"}}, {"config": types.SimpleNamespace(model_mode="dual")},
+                 {"args": types.SimpleNamespace(model_mode="dual")},
+                 {"model_mode": "dual", "config": {"model_mode": "dual"}, "args": types.SimpleNamespace(model_mode="dual")})
+        base = copy.deepcopy(self.checkpoint)
+        for change in cases:
+            with self.subTest(change=change):
+                self.checkpoint.clear()
+                self.checkpoint.update(copy.deepcopy(base), **change)
+                _, metadata = self.check()
+                self.assertEqual(metadata["model_mode_confirmation"], "explicit_dual")
+                self.assertTrue(metadata["model_mode_evidence"]["declarations"])
+                self.assertEqual(set(metadata["model_mode_evidence"]["declarations"].values()), {"dual"})
+                self.assertTrue(metadata["model_mode_evidence"]["strict_load"])
+
+    def test_every_explicit_nondual_value_is_rejected(self):
+        base = copy.deepcopy(self.checkpoint)
+        for source in ("checkpoint", "config", "args"):
+            for value in ("rgb-only", "freq-only", "unknown", None, "", False):
+                with self.subTest(source=source, value=value):
+                    self.checkpoint.clear()
+                    self.checkpoint.update(copy.deepcopy(base))
+                    target = self.checkpoint if source == "checkpoint" else self.checkpoint.setdefault(source, {})
+                    target["model_mode"] = value
+                    with self.assertRaisesRegex(ValueError, "model_mode"):
+                        self.check()
+        self.factory.assert_not_called()
+        self.load_stats.assert_not_called()
+
+    def test_conflicts_cannot_be_hidden_by_top_level_or_config_precedence(self):
+        cases = ({"model_mode": "dual", "config": {"model_mode": "freq-only"}},
+                 {"model_mode": "rgb-only", "config": {"model_mode": "dual"}},
+                 {"config": {"model_mode": "dual"}, "args": {"model_mode": "freq-only"}},
+                 {"config": {"model_mode": "rgb-only"}, "args": types.SimpleNamespace(model_mode="dual")},
+                 {"model_mode": "dual", "config": {}, "args": types.SimpleNamespace(model_mode="rgb-only")})
+        base = copy.deepcopy(self.checkpoint)
+        for change in cases:
+            with self.subTest(change=change):
+                self.checkpoint.clear()
+                self.checkpoint.update(copy.deepcopy(base), **change)
+                with self.assertRaisesRegex(ValueError, "conflicting metadata"):
+                    self.check()
+        self.factory.assert_not_called()
+
+    def test_legacy_and_explicit_dual_reject_missing_branch_and_partial_branch(self):
+        base = copy.deepcopy(self.checkpoint["model"])
+        for explicit in (False, True):
+            if explicit:
+                self.checkpoint["model_mode"] = "dual"
+            for prefix in ("rgb_backbone.", "rgb_projector.", "freq_backbone.", "freq_projector."):
+                for entire_branch in (False, True):
+                    with self.subTest(explicit=explicit, prefix=prefix, entire_branch=entire_branch):
+                        self.checkpoint["model"] = {name: tensor for name, tensor in base.items()
+                                                    if not (name.startswith(prefix) if entire_branch else name == prefix + "weight")}
+                        with self.assertRaisesRegex(ValueError, "Incomplete dual checkpoint branch"):
+                            self.check()
+        self.model.load_state_dict.assert_not_called()
+
+    def test_strict_load_still_rejects_missing_buffers_extra_keys_and_wrong_shapes(self):
+        base = copy.deepcopy(self.checkpoint["model"])
+        for change in ("missing_buffer", "extra_key", "wrong_shape"):
+            with self.subTest(change=change):
+                self.checkpoint["model"] = copy.deepcopy(base)
+                if change == "missing_buffer":
+                    del self.checkpoint["model"]["freq_std"]
+                elif change == "extra_key":
+                    self.checkpoint["model"]["unexpected.weight"] = self.Tensor()
+                else:
+                    self.checkpoint["model"]["freq_backbone.weight"] = self.Tensor((1, 2))
+                with self.assertRaisesRegex(RuntimeError, "SYNTHETIC strict"):
+                    self.check()
+                self.assertTrue(self.model.load_state_dict.call_args.kwargs["strict"])
+        self.model.set_freq_stats.assert_not_called()
+
+    def test_legacy_still_rejects_nonfinite_parameters_and_invalid_stats(self):
+        self.checkpoint["model"]["rgb_backbone.weight"] = self.Tensor((math.nan,))
+        with self.assertRaisesRegex(ValueError, "Non-finite checkpoint tensor"):
+            self.check()
+        self.checkpoint["model"] = copy.deepcopy(self.expected)
+        for name, values in (("mean", (math.nan, 0, 0)), ("std", (1, math.inf, 1)), ("std", (1, -1, 1))):
+            with self.subTest(name=name, values=values):
+                self.stats.update(mean=self.Tensor((0, 0, 0)), std=self.Tensor((1, 1, 1)))
+                self.stats[name] = self.Tensor(values)
+                with self.assertRaisesRegex(ValueError, "Stats must be finite"):
+                    self.check()
+
+    def test_exclude_class_conflict_in_args_remains_rejected(self):
+        self.checkpoint.update(config={"model_mode": "dual"}, args=types.SimpleNamespace(exclude_class="SD"))
+        with self.assertRaisesRegex(ValueError, "args.exclude_class"):
+            self.check()
+        self.factory.assert_not_called()
 
 
 def numpy_loss_adapter():
