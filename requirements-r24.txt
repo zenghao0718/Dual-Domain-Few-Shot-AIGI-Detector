@@ -1,0 +1,5 @@
+# Install only in the existing AutoDL DDFSD environment; no new torch/CUDA pin.
+# v4 API: CLIPImageProcessor + CLIPVisionModelWithProjection.image_embeds.
+transformers>=4.53.3,<5
+huggingface_hub>=0.34,<1
+safetensors>=0.4.3

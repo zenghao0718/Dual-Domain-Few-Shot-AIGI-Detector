@@ -84,6 +84,28 @@ def evaluate_binary_few_shot(
 ) -> Dict[str, Any]:
     """Evaluate real-vs-fake with fixed support and remaining val images as query."""
 
+    return _evaluate_binary_few_shot_impl(
+        model=model, data_root=data_root, fake_class=fake_class, support_shot=support_shot,
+        seed=seed, batch_size=batch_size, num_workers=num_workers, device=device,
+        use_fp16=use_fp16, tau=tau, tau_r=tau_r, max_query_per_class=max_query_per_class,
+        model_mode=model_mode, branch_mode=branch_mode, return_indices=return_indices,
+        strict_images=strict_images,
+    )
+
+
+@torch.no_grad()
+def _evaluate_binary_few_shot_impl(
+    model, data_root, fake_class, support_shot, seed, batch_size, num_workers,
+    device, use_fp16, tau, tau_r, max_query_per_class=0, model_mode="dual",
+    branch_mode=None, return_indices=False, strict_images=False,
+    selection=None, datasets=None, return_alpha=False,
+):
+    """Shared computation; R2-4 supplies observed support groups, never query labels.
+
+    The public entrypoint leaves selection/datasets/return_alpha at their
+    defaults, retaining its original sampling, tensor order and output fields.
+    """
+
     if model_mode not in VALID_MODEL_MODES:
         raise ValueError(f"Unknown model_mode '{model_mode}', expected one of {VALID_MODEL_MODES}")
     branch_mode = branch_mode or model_mode
@@ -93,28 +115,43 @@ def evaluate_binary_few_shot(
         raise ValueError(f"A {model_mode} checkpoint can only be evaluated with branch_mode={model_mode}.")
 
     model.eval()
-    real_dataset = load_ddfsd_class_dataset(
-        data_root, "real", "val", strict_images=strict_images
-    )
-    fake_dataset = load_ddfsd_class_dataset(
-        data_root, fake_class, "val", strict_images=strict_images
-    )
+    if datasets is None:
+        real_dataset = load_ddfsd_class_dataset(
+            data_root, "real", "val", strict_images=strict_images
+        )
+        fake_dataset = load_ddfsd_class_dataset(
+            data_root, fake_class, "val", strict_images=strict_images
+        )
+    else:
+        real_dataset, fake_dataset = datasets
     max_query = max_query_per_class if max_query_per_class > 0 else None
 
-    real_support_idx, real_query_idx = sample_support_query_indices(
-        len(real_dataset), support_shot=support_shot, seed=seed, max_query=max_query
-    )
-    fake_support_idx, fake_query_idx = sample_support_query_indices(
-        len(fake_dataset), support_shot=support_shot, seed=seed, max_query=max_query
-    )
-
-    support_images = torch.cat(
-        [
-            _stack_dataset_items(real_dataset, real_support_idx),
-            _stack_dataset_items(fake_dataset, fake_support_idx),
-        ],
-        dim=0,
-    )
+    if selection is None:
+        real_support_idx, real_query_idx = sample_support_query_indices(
+            len(real_dataset), support_shot=support_shot, seed=seed, max_query=max_query
+        )
+        fake_support_idx, fake_query_idx = sample_support_query_indices(
+            len(fake_dataset), support_shot=support_shot, seed=seed, max_query=max_query
+        )
+        support_images = torch.cat(
+            [
+                _stack_dataset_items(real_dataset, real_support_idx),
+                _stack_dataset_items(fake_dataset, fake_support_idx),
+            ],
+            dim=0,
+        )
+    else:
+        from util.ddfsd_r24 import validate_selection
+        validate_selection(selection, len(real_dataset), len(fake_dataset))
+        if support_shot != 10 or max_query_per_class != 0 or return_indices:
+            raise ValueError("Selected R2-4 support requires 10-shot, ALL queries and its own source manifest")
+        real_query_idx, fake_query_idx = selection["query_indices"]
+        real_support_idx, fake_support_idx = selection["groups"]
+        sources = (real_dataset, fake_dataset)
+        support_images = torch.cat([
+            torch.stack([sources[source][index][0] for source, index in group], dim=0)
+            for group in selection["groups"]
+        ], dim=0)
     support_rgb_flat, support_freq_flat = encode_batch(model, support_images, device, use_fp16)
     support_rgb = (
         support_rgb_flat.reshape(2, support_shot, -1).permute(1, 0, 2).unsqueeze(0)
@@ -176,6 +213,11 @@ def evaluate_binary_few_shot(
             "alpha_max": float(alpha.detach().float().max().cpu()) if alpha is not None else "",
         }
     )
+    if return_alpha:
+        if alpha is None:
+            raise ValueError("R2-4 alpha diagnostics require dual mode")
+        metrics["alpha_real"] = float(alpha[0, 0].detach().float().cpu())
+        metrics["alpha_fake"] = float(alpha[0, 1].detach().float().cpu())
     if return_indices:
         metrics["sampling"] = {
             "real": {

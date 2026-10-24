@@ -14,6 +14,8 @@
 R2-1 support reliability diagnostics: [AutoDL one-command evaluation and local validation](docs/R21_RELIABILITY_USAGE.md).
 This adds analysis of the existing final dual checkpoints; GPU experiment results are generated only when run on AutoDL.
 
+R2-4 support-quality experiments (label noise and CLIP-concentrated support): [AutoDL preparation, commands and validation](docs/R2-4_support_quality_experiments.md). These use frozen final checkpoints and preserve the original main evaluation interface.
+
 This repository provides the implementation of DDFSD, a few-shot detector for identifying AI-generated images from an unseen target generator. DDFSD learns dual-domain prototype spaces from RGB content and signed high-frequency Haar-DWT responses. Class-specific adaptive weights fuse the two domains according to support-set dispersion, allowing the more reliable domain to contribute more strongly to each class decision.
 
 During episodic training, an asymmetric prototype margin strengthens real-fake separation while preserving structure between fake-generator classes. At test time, the encoders remain frozen: real and fake prototypes are built directly from the target support set, and the remaining target images are classified without gradient updates on the target generator.

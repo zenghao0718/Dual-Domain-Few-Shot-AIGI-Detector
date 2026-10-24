@@ -1,4 +1,8 @@
 import unittest
+import importlib.util
+
+if importlib.util.find_spec("torch") is None:
+    raise unittest.SkipTest("NOT_RUN_ENV_MISSING: original DDFSD core tests require torch")
 
 import torch
 

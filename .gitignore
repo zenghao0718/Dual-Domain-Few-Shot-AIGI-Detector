@@ -209,3 +209,21 @@ per_task/
 .r21.lock
 GenImage/
 DDFSD_pretrained/
+
+# R2-4 support-quality inputs, caches and results stay outside the checkout.
+*.bin
+*.safetensors
+.env*
+r24/
+r24_*/
+R24*/
+clip_cache*/
+.r24.lock
+per_seed.csv
+summary.csv
+support_manifest.csv
+clip_concentration.csv
+all_generators_summary.csv
+baseline_reference_summary.csv
+baseline_comparison.csv
+R24_REPORT.md
